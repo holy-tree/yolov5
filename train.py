@@ -207,7 +207,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     train_path, val_path = data_dict['train'], data_dict['val']
     train_path_label, train_path_unlabel = data_dict['train_label'], data_dict['train_unlabel']
-    test_path1, test_path2, test_path3 = data_dict['test1'], data_dict['test2'], data_dict['test3']
     
 
     # Trainloader
