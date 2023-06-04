@@ -1,0 +1,44 @@
+<annotation>
+	<folder>WH_data</folder>
+	<filename>00541.JPEG</filename>
+	<source>
+		<database>WH Data</database>
+		<annotation>WH</annotation>
+		<image>flickr</image>
+		<flickrid>NULL</flickrid>
+	</source>
+	<owner>
+		<flickrid>NULL</flickrid>
+		<name>WH</name>
+	</owner>
+	<size>
+		<width>867</width>
+		<height>616</height>
+		<depth>3</depth>
+	</size>
+		<segmented>0</segmented>
+	<object>
+		<name>n</name>
+		<pose>Unspecified</pose>
+		<truncated>1</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>216</xmin>
+			<ymin>129</ymin>
+			<xmax>420</xmax>
+			<ymax>257</ymax>
+		</bndbox>
+	</object>
+	<object>
+		<name>n</name>
+		<pose>Unspecified</pose>
+		<truncated>1</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>448</xmin>
+			<ymin>85</ymin>
+			<xmax>708</xmax>
+			<ymax>229</ymax>
+		</bndbox>
+	</object>
+</annotation>

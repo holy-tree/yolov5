@@ -1,0 +1,44 @@
+<annotation>
+	<folder>WH_data</folder>
+	<filename>15076.JPEG</filename>
+	<source>
+		<database>WH Data</database>
+		<annotation>WH</annotation>
+		<image>flickr</image>
+		<flickrid>NULL</flickrid>
+	</source>
+	<owner>
+		<flickrid>NULL</flickrid>
+		<name>WH</name>
+	</owner>
+	<size>
+		<width>816</width>
+		<height>577</height>
+		<depth>3</depth>
+	</size>
+		<segmented>0</segmented>
+	<object>
+		<name>n</name>
+		<pose>Unspecified</pose>
+		<truncated>1</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>476</xmin>
+			<ymin>87</ymin>
+			<xmax>630</xmax>
+			<ymax>240</ymax>
+		</bndbox>
+	</object>
+	<object>
+		<name>n</name>
+		<pose>Unspecified</pose>
+		<truncated>1</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>293</xmin>
+			<ymin>119</ymin>
+			<xmax>375</xmax>
+			<ymax>151</ymax>
+		</bndbox>
+	</object>
+</annotation>

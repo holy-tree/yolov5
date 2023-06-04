@@ -1,0 +1,44 @@
+<annotation>
+	<folder>WH_data</folder>
+	<filename>08032.JPEG</filename>
+	<source>
+		<database>WH Data</database>
+		<annotation>WH</annotation>
+		<image>flickr</image>
+		<flickrid>NULL</flickrid>
+	</source>
+	<owner>
+		<flickrid>NULL</flickrid>
+		<name>WH</name>
+	</owner>
+	<size>
+		<width>867</width>
+		<height>616</height>
+		<depth>3</depth>
+	</size>
+		<segmented>0</segmented>
+	<object>
+		<name>n</name>
+		<pose>Unspecified</pose>
+		<truncated>1</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>181</xmin>
+			<ymin>194</ymin>
+			<xmax>258</xmax>
+			<ymax>242</ymax>
+		</bndbox>
+	</object>
+	<object>
+		<name>n</name>
+		<pose>Unspecified</pose>
+		<truncated>1</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>343</xmin>
+			<ymin>121</ymin>
+			<xmax>638</xmax>
+			<ymax>288</ymax>
+		</bndbox>
+	</object>
+</annotation>

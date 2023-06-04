@@ -120,6 +120,7 @@ def create_dataloader(path,
     if rect and shuffle:
         LOGGER.warning('WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
+    
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
         dataset = LoadImagesAndLabels(
             path,
@@ -140,8 +141,8 @@ def create_dataloader(path,
     nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
     sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
     loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
-    generator = torch.Generator()
-    generator.manual_seed(6148914691236517205 + RANK)
+    # generator = torch.Generator()
+    # generator.manual_seed(6148914691236517205 + RANK)
     return loader(dataset,
                   batch_size=batch_size,
                   shuffle=shuffle and sampler is None,
@@ -150,7 +151,8 @@ def create_dataloader(path,
                   pin_memory=PIN_MEMORY,
                   collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
                   worker_init_fn=seed_worker,
-                  generator=generator), dataset
+                  ), dataset
+
 
 
 class InfiniteDataLoader(dataloader.DataLoader):

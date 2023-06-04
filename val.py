@@ -40,11 +40,12 @@ from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
 from utils.general import (LOGGER, Profile, check_dataset, check_img_size, check_requirements, check_yaml,
                            coco80_to_coco91_class, colorstr, increment_path, non_max_suppression, print_args,
-                           scale_boxes, xywh2xyxy, xyxy2xywh)
+                           scale_boxes, xywh2xyxy, xyxy2xywh, xywhn2xyxy)
 from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
+import cv2
 
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
@@ -144,7 +145,7 @@ def run(
         imgsz = check_img_size(imgsz, s=stride)  # check image size
         half = model.fp16  # FP16 supported on limited backends with CUDA
         if engine:
-            batch_size = model.batch_size
+            batch_size = model.batch_size   
         else:
             device = model.device
             if not (pt or jit):
@@ -164,10 +165,10 @@ def run(
 
     # Dataloader
     if not training:
-        if pt and not single_cls:  # check --weights are trained on --data
-            ncm = model.model.nc
-            assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
-                              f'classes). Pass correct combination of --weights and --data that are trained together.'
+        # if pt and not single_cls:  # check --weights are trained on --data
+            # ncm = model.model.nc
+            # assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
+            #                   f'classes). Pass correct combination of --weights and --data that are trained together.'
         model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
@@ -194,6 +195,8 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+
+
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
         with dt[0]:
@@ -203,7 +206,7 @@ def run(
             im = im.half() if half else im.float()  # uint8 to fp16/32
             im /= 255  # 0 - 255 to 0.0 - 1.0
             nb, _, height, width = im.shape  # batch size, channels, height, width
-
+        
         # Inference
         with dt[1]:
             preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
@@ -243,7 +246,11 @@ def run(
             if single_cls:
                 pred[:, 5] = 0
             predn = pred.clone()
+
+           
             scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+            
+
 
             # Evaluate
             if nl:
@@ -338,15 +345,18 @@ def run(
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
-    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path(s)')
-    parser.add_argument('--batch-size', type=int, default=32, help='batch size')
+    parser.add_argument('--data', type=str, default=ROOT / 'data/H50H60.yaml', help='dataset.yaml path')
+    # parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'runs/doctor/exp19/weights/best.pt', help='model path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'weights/TN/TN_H60.pt', help='model path(s)')
+    parser.add_argument('--device', default='1', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    
+
+    parser.add_argument('--batch-size', type=int, default=4, help='batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
     parser.add_argument('--max-det', type=int, default=300, help='maximum detections per image')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
     parser.add_argument('--augment', action='store_true', help='augmented inference')

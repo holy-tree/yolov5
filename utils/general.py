@@ -226,6 +226,12 @@ def print_args(args: Optional[dict] = None, show_file=True, show_func=False):
 
 def init_seeds(seed=0, deterministic=False):
     # Initialize random number generator (RNG) seeds https://pytorch.org/docs/stable/notes/randomness.html
+    seed = (
+            os.getpid()
+            + int(datetime.now().strftime("%S%f"))
+            + int.from_bytes(os.urandom(2), "big")
+        )
+    print(f"random seed: {seed}")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -492,7 +498,7 @@ def check_dataset(data, autodownload=True):
     if not path.is_absolute():
         path = (ROOT / path).resolve()
         data['path'] = path  # download scripts
-    for k in 'train', 'val', 'test':
+    for k in 'train', 'val', 'test', 'train_label', 'train_unlabel':
         if data.get(k):  # prepend path
             if isinstance(data[k], str):
                 x = (path / data[k]).resolve()
@@ -875,6 +881,13 @@ def non_max_suppression(
     bs = prediction.shape[0]  # batch size
     nc = prediction.shape[2] - nm - 5  # number of classes
     xc = prediction[..., 4] > conf_thres  # candidates
+    
+    # print(prediction.shape)
+    # print(bs)
+    # print(nc)
+    # print(xc)
+    # quit()
+
 
     # Checks
     assert 0 <= conf_thres <= 1, f'Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0'

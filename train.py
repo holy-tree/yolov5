@@ -24,7 +24,7 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-
+from collections import OrderedDict
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -32,6 +32,8 @@ import torch.nn as nn
 import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
+import torchvision.transforms as transforms
+from torch.nn import functional as F
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -50,7 +52,8 @@ from utils.downloads import attempt_download, is_url
 from utils.general import (LOGGER, check_amp, check_dataset, check_file, check_git_status, check_img_size,
                            check_requirements, check_suffix, check_yaml, colorstr, get_latest_run, increment_path,
                            init_seeds, intersect_dicts, labels_to_class_weights, labels_to_image_weights, methods,
-                           one_cycle, print_args, print_mutation, strip_optimizer, yaml_save)
+                           one_cycle, print_args, print_mutation, strip_optimizer, yaml_save, non_max_suppression,
+                           scale_boxes, xywhn2xyxy, xyxy2xywh, xyxy2xywhn)
 from utils.loggers import Loggers
 from utils.loggers.comet.comet_utils import check_comet_resume
 from utils.loss import ComputeLoss
@@ -63,17 +66,20 @@ LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
+import pprint
+import cv2
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
         opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
     callbacks.run('on_pretrain_routine_start')
-
+    
     # Directories
     w = save_dir / 'weights'  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
     last, best = w / 'last.pt', w / 'best.pt'
+    last_teacher, best_teacher = w / 'last_teacher.pt', w / 'best_teacher.pt'
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -107,45 +113,60 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     init_seeds(opt.seed + 1 + RANK, deterministic=True)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
-    train_path, val_path = data_dict['train'], data_dict['val']
+   
+
+
+    
+
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = {0: 'item'} if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
-    is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
+    # is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
+    is_coco = False
 
-    # Model
+
+    # Model 
     check_suffix(weights, '.pt')  # check weights
-    pretrained = weights.endswith('.pt')
-    if pretrained:
-        with torch_distributed_zero_first(LOCAL_RANK):
-            weights = attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
-        csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
-        model.load_state_dict(csd, strict=False)  # load
-        LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
-    else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-    amp = check_amp(model)  # check AMP
+    # pretrained = weights.endswith('.pt')
+    # with torch_distributed_zero_first(LOCAL_RANK):
+    #     weights = attempt_download(weights)  # download if not found locally
 
-    # Freeze
-    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-        if any(x in k for x in freeze):
-            LOGGER.info(f'freezing {k}')
-            v.requires_grad = False
+    ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+
+
+    model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+    model_teacher = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
+
+    exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
+    csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
+    csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
+    model.load_state_dict(csd, strict=False)  # load
+    model_teacher.load_state_dict(csd, strict=False)  # load
+
+
+    LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
+    # else:
+    #     model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+    
+    amp = check_amp(model)  # check AMP
+    # Freeze 冻结模型部分参数
+    # freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+    # for k, v in model.named_parameters():
+    #     v.requires_grad = True  # train all layers
+    #     # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
+    #     if any(x in k for x in freeze):
+    #         LOGGER.info(f'freezing {k}')
+    #         v.requires_grad = False
+
 
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
 
     # Batch size
-    if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
-        batch_size = check_train_batch_size(model, imgsz, amp)
-        loggers.on_params_update({"batch_size": batch_size})
+    # if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
+    #     batch_size = check_train_batch_size(model, imgsz, amp)
+    #     loggers.on_params_update({"batch_size": batch_size})
+    
 
     # Optimizer
     nbs = 64  # nominal batch size
@@ -160,72 +181,72 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
+
     # EMA
-    ema = ModelEMA(model) if RANK in {-1, 0} else None
+    # ema = ModelEMA(model) if RANK in {-1, 0} else None
+    ema = None
 
     # Resume
-    best_fitness, start_epoch = 0.0, 0
-    if pretrained:
-        if resume:
-            best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
-        del ckpt, csd
+    best_fitness, best_fitness_teacher, start_epoch = 0.0, 0.0, 0
+    # if resume:
+    #     best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
+
+    del ckpt, csd
 
     # DP mode
-    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
-        LOGGER.warning('WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
-                       'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
-        model = torch.nn.DataParallel(model)
+    # if cuda and RANK == -1 and torch.cuda.device_count() > 1:
+    #     LOGGER.warning('WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
+    #                    'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
+    #     model = torch.nn.DataParallel(model)
 
     # SyncBatchNorm
-    if opt.sync_bn and cuda and RANK != -1:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-        LOGGER.info('Using SyncBatchNorm()')
+    # if opt.sync_bn and cuda and RANK != -1:
+    #     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+    #     LOGGER.info('Using SyncBatchNorm()')
+    
+
+    train_path, val_path = data_dict['train'], data_dict['val']
+    train_path_label, train_path_unlabel = data_dict['train_label'], data_dict['train_unlabel']
+    test_path1, test_path2, test_path3 = data_dict['test1'], data_dict['test2'], data_dict['test3']
+    
 
     # Trainloader
-    train_loader, dataset = create_dataloader(train_path,
-                                              imgsz,
-                                              batch_size // WORLD_SIZE,
-                                              gs,
-                                              single_cls,
-                                              hyp=hyp,
-                                              augment=True,
-                                              cache=None if opt.cache == 'val' else opt.cache,
-                                              rect=opt.rect,
-                                              rank=LOCAL_RANK,
-                                              workers=workers,
-                                              image_weights=opt.image_weights,
-                                              quad=opt.quad,
-                                              prefix=colorstr('train: '),
-                                              shuffle=True)
-    labels = np.concatenate(dataset.labels, 0)
+    label_train_loader, label_dataset = create_dataloader(train_path_label, imgsz, batch_size // WORLD_SIZE,
+        gs, single_cls, hyp=hyp, augment=True, cache=None if opt.cache == 'val' else opt.cache, rect=opt.rect,
+        rank=LOCAL_RANK, workers=workers, image_weights=opt.image_weights, quad=opt.quad, 
+        prefix=colorstr('train_label: '), shuffle=True)
+    
+    unlabel_train_loader, unlabel_dataset = create_dataloader(train_path_unlabel, imgsz, batch_size // WORLD_SIZE,
+        gs, single_cls, hyp=hyp, augment=True, cache=None if opt.cache == 'val' else opt.cache, rect=opt.rect,
+        rank=LOCAL_RANK, workers=workers, image_weights=opt.image_weights, quad=opt.quad,
+        prefix=colorstr('train_unlabel: '), shuffle=True)
+    
+
+    # labels.shape = (2912, 5)
+    labels = np.concatenate(label_dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
     # Process 0
-    if RANK in {-1, 0}:
-        val_loader = create_dataloader(val_path,
-                                       imgsz,
-                                       batch_size // WORLD_SIZE * 2,
-                                       gs,
-                                       single_cls,
-                                       hyp=hyp,
-                                       cache=None if noval else opt.cache,
-                                       rect=True,
-                                       rank=-1,
-                                       workers=workers * 2,
-                                       pad=0.5,
-                                       prefix=colorstr('val: '))[0]
+    # if RANK in {-1, 0}:
+    val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls, hyp=hyp,
+        cache=None if noval else opt.cache, rect=True, rank=-1, workers=workers * 2, pad=0.5,
+        prefix=colorstr('val: '))[0]
+    
 
-        if not resume:
-            if not opt.noautoanchor:
-                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
-            model.half().float()  # pre-reduce anchor precision
+    if not resume:
+        # opt.noautoanchor = False
+        if not opt.noautoanchor:
+            check_anchors(label_dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
+            check_anchors(unlabel_dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
+        model.half().float()  # pre-reduce anchor precision
+        model_teacher.half().float()  # pre-reduce anchor precision
 
-        callbacks.run('on_pretrain_routine_end', labels, names)
+    callbacks.run('on_pretrain_routine_end', labels, names)
 
     # DDP mode
-    if cuda and RANK != -1:
-        model = smart_DDP(model)
+    # if cuda and RANK != -1:
+    #     model = smart_DDP(model)
 
     # Model attributes
     nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
@@ -235,12 +256,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
-    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    model.class_weights = labels_to_class_weights(label_dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
+    model_teacher.nc = nc  # attach number of classes to model
+    model_teacher.hyp = hyp  # attach hyperparameters to model
+    model_teacher.class_weights = labels_to_class_weights(label_dataset.labels, nc).to(device) * nc  # attach class weights
+    model_teacher.names = names
 
+
+   
     # Start training
     t0 = time.time()
-    nb = len(train_loader)  # number of batches
+    nb = min(len(label_train_loader), len(unlabel_train_loader))  # number of batches
     nw = max(round(hyp['warmup_epochs'] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
@@ -252,35 +279,126 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run('on_train_start')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
-                f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
+                f'Using {label_train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
+        model_teacher.eval()
 
         # Update image weights (optional, single-GPU only)
-        if opt.image_weights:
-            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
-            iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
-            dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
+        # image_weights = False
+        # if opt.image_weights:
+        #     cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
+        #     iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
+        #     dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
 
         # Update mosaic border (optional)
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
         mloss = torch.zeros(3, device=device)  # mean losses
-        if RANK != -1:
-            train_loader.sampler.set_epoch(epoch)
-        pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'Instances', 'Size'))
+        # if RANK != -1:
+        #     train_loader.sampler.set_epoch(epoch)
+        
+        # unlabel_train_loader_enumerate = enumerate(unlabel_train_loader)
+        # pbar = enumerate(label_train_loader)
+        pbar = enumerate([ind for ind in range(nb)])
+        label_data_iter = iter(label_train_loader)
+        unlabel_data_iter = iter(unlabel_train_loader)
+
+
+        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'l_label', 'l_unlabel', 'loss_cons', 'Instances', 'Size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-            callbacks.run('on_train_batch_start')
+
+
+        # for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        # for (label_data, unlabel_data) in zip(pbar, unlabel_train_loader_enumerate):  # batch -------------------------------------------------------------
+        #     callbacks.run('on_train_batch_start')
+        
+        for i, ind in pbar:
+
+            label_imgs, label_targets, label_paths, _ = next(label_data_iter)
+            unlabel_imgs, unlabel_targets, unlabel_paths, _ = next(unlabel_data_iter)
+
+            # (i, label_data) = label_data
+            # label_imgs, label_targets, label_paths, _ = label_data
+            # (_, unlabel_data) = unlabel_data
+            # unlabel_imgs, unlabel_targets, unlabel_paths, _ = unlabel_data
+
+            
+            aug_label_imgs = label_imgs.clone().detach()
+            aug_unlabel_imgs = unlabel_imgs.clone().detach()
+            augmentation = []
+            # 随机调整(概率为0.8)亮度、对比度、饱和度和色相
+            augmentation.append(transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8))
+            # # 将图像概率调整为灰度图
+            augmentation.append(transforms.RandomGrayscale(p=0.2))
+            augmentation.append(transforms.RandomApply([transforms.GaussianBlur(11, sigma=(0.1, 2.0))], p=0.5))
+            randcrop_transform = transforms.Compose(
+                [
+                    # transforms.ToTensor(),
+                    transforms.RandomErasing(p=0.7, scale=(0.05, 0.2), ratio=(0.3, 3.3), value="random"),
+                    transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.1, 6), value="random"),
+                    transforms.RandomErasing(p=0.3, scale=(0.02, 0.2), ratio=(0.05, 8), value="random"),
+                    # transforms.ToPILImage(),
+                ]
+            )
+            augmentation.append(randcrop_transform)
+            aug = transforms.Compose(augmentation)
+            for i in range(aug_unlabel_imgs.shape[0]):
+                aug_unlabel_imgs[i] = aug(aug_unlabel_imgs[i])
+            for i in range(aug_label_imgs.shape[0]):
+                aug_label_imgs[i] = aug(aug_label_imgs[i])
+
+
+            # for i in [0,1,2,3]:
+            #     img = unlabel_imgs[i].clone().detach().double().to(torch.device('cpu'))
+            #     img = np.ascontiguousarray(img.numpy().transpose((1,2,0)))
+
+            #     for index, img_number in enumerate(unlabel_targets[:, :1]):
+            #         if img_number == i:
+            #             x_center = float(unlabel_targets[index][2])*640 + 1
+            #             y_center = float(unlabel_targets[index][3])*640 + 1
+            #             xminVal = int(x_center - 0.5*float(unlabel_targets[index][4])*640)   # object_info列表中的元素都是字符串类型
+            #             yminVal = int(y_center - 0.5*float(unlabel_targets[index][5])*640)
+            #             xmaxVal = int(x_center + 0.5*float(unlabel_targets[index][4])*640)
+            #             ymaxVal = int(y_center + 0.5*float(unlabel_targets[index][5])*640)
+            #             img = cv2.rectangle(img, (xminVal, yminVal), (xmaxVal, ymaxVal), (0,255,0),2)
+            #     cv2.imwrite(f"unlabel_img{i}.jpg", img)
+
+
+            #     img = unlabel_imgs[i].clone().detach().double().to(torch.device('cpu'))
+            #     img = np.ascontiguousarray(img.numpy().transpose((1,2,0)))
+            #     cv2.imwrite(f"unlabel_img_native{i}.jpg", img)
+
+
+            # quit()
+            
+            # pprint.pprint(i)
+            # pprint.pprint(label_imgs.shape)
+            # pprint.pprint(label_targets.shape)
+            # pprint.pprint(unlabel_imgs.shape)
+            # pprint.pprint(unlabel_targets.shape)
+            # pprint.pprint(label_paths)
+            # pprint.pprint(unlabel_paths)
+            
+            # img = unlabel_imgs[1].clone().detach().double().to(torch.device('cpu'))
+            # img = np.ascontiguousarray(img.numpy().transpose((1,2,0)))
+            
+
+
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            label_imgs = label_imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            unlabel_imgs = unlabel_imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            aug_unlabel_imgs = aug_unlabel_imgs.to(device, non_blocking=True).float() / 255
+            aug_label_imgs = aug_label_imgs.to(device, non_blocking=True).float() / 255
+
 
             # Warmup
             if ni <= nw:
@@ -293,18 +411,105 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
 
-            # Multi-scale
-            if opt.multi_scale:
-                sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
-                sf = sz / max(imgs.shape[2:])  # scale factor
-                if sf != 1:
-                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
-                    imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
+
+            # EMA更新teacher模型
+            with torch.no_grad():
+                student_model_dict = model.state_dict()
+                new_teacher_dict = OrderedDict()
+                for key, value in model_teacher.state_dict().items():
+                    if key in student_model_dict.keys():
+                        new_teacher_dict[key] = (student_model_dict[key] * (1 - 0.9996) + value * 0.9996)
+                    else:
+                        raise Exception("{} is not found in student model".format(key))
+                model_teacher.load_state_dict(new_teacher_dict)
+
+            # opt.multi_scale = False
+            # Multi-scale
+            # if opt.multi_scale:
+            #     sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
+            #     sf = sz / max(imgs.shape[2:])  # scale factor
+            #     if sf != 1:
+            #         ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+            #         imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+
+            
             # Forward
             with torch.cuda.amp.autocast(amp):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                # len(pred) = 3
+                # pred[0].shape = [4,3,80,80,6]
+                # pred[1].shape = [4,3,40,40,6]
+                # pred[2].shape = [4,3,20,20,6]
+                
+
+                # 由于model.eval()
+                # len(pred)=2 pred[0].shape=[4,25222,6]
+                # len(pred[1])=3
+                # pred = model(label_imgs)  # forward
+                # 计算伪标签
+                with torch.no_grad():
+                    pseudo_preds = model_teacher(unlabel_imgs)
+                    pseudo_preds = non_max_suppression(pseudo_preds, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=single_cls, max_det=1000)
+                    pseudo_labels = torch.empty((0,6)).to(device)
+                    for i, pred in enumerate(pseudo_preds):
+                        pred_num = pred.shape[0]
+                        num_class = torch.zeros(pred_num, 2).to(device)
+                        num_class[:,0] = i
+                        pseudo_label = torch.cat([num_class, xyxy2xywhn(pred[:,:4])], 1)
+                        pseudo_labels = torch.cat([pseudo_labels, pseudo_label], 0)
+
+
+                # for index, img_number in enumerate(pseudo_labels[:, :1]):
+                #     if img_number == 1:
+                #         x_center = float(pseudo_labels[index][2])*640 + 1
+                #         y_center = float(pseudo_labels[index][3])*640 + 1
+                #         xminVal = int(x_center - 0.5*float(pseudo_labels[index][4])*640)   # object_info列表中的元素都是字符串类型
+                #         yminVal = int(y_center - 0.5*float(pseudo_labels[index][5])*640)
+                #         xmaxVal = int(x_center + 0.5*float(pseudo_labels[index][4])*640)
+                #         ymaxVal = int(y_center + 0.5*float(pseudo_labels[index][5])*640)
+                #         img = cv2.rectangle(img, (xminVal, yminVal), (xmaxVal, ymaxVal), (0,255,0),2)
+                # cv2.imwrite(f"pseudo_label.jpg", img)
+
+                # quit()
+
+
+                # 伪标签监督
+                unlabel_pred, unlabel_mean, unlabel_std = model(unlabel_imgs, pre_adain=True)
+                # unlabel_pred = model(unlabel_imgs)
+                unlabel_loss, unlabel_loss_items = compute_loss(unlabel_pred, pseudo_labels, unlabel=True)
+                # unlabel_loss = unlabel_loss * 0.1
+
+                # 有监督训练部分
+                pred = model(label_imgs)
+                label_loss, label_loss_items = compute_loss(pred, label_targets.to(device))
+
+                # adain模块
+                pred_adain = model(label_imgs, adain=True, unlabel_mean=unlabel_mean, unlabel_std=unlabel_std)
+                label_adain_loss, label_adain_loss_items = compute_loss(pred_adain, label_targets.to(device))  
+
+                
+                label_feature = model(label_imgs, get_feature=True)
+                aug_label_feature = model(aug_label_imgs, get_feature=True)
+                
+                
+                loss_img_cons = 0.0
+                for feature, aug_feature in zip(label_feature, aug_label_feature):
+                    loss_img_cons += F.mse_loss(feature, aug_feature)
+                loss_img_cons = loss_img_cons * 0.1
+
+                loss_ins_cons = 0.0
+                for p, p_adain in zip(pred, pred_adain):
+                    loss_ins_cons += F.mse_loss(p, p_adain)
+                loss_ins_cons = loss_ins_cons * 0.1
+                loss_cons =  loss_ins_cons + loss_img_cons
+
+
+                # loss_cons = 0
+                loss = unlabel_loss + label_loss + label_adain_loss * 0.1 + loss_cons * 0.1
+                # loss = unlabel_loss + label_loss + label_adain_loss * 0.1
+                # loss = unlabel_loss + label_loss
+
+
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -326,11 +531,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Log
             if RANK in {-1, 0}:
-                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                mloss = (mloss * i + label_loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
+                # pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+                #                      (f'{epoch}/{epochs - 1}', mem, *mloss, label_targets.shape[0], label_imgs.shape[-1]))
                 pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
-                                     (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
-                callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
+                                     (f'{epoch}/{epochs - 1}', mem, label_loss, unlabel_loss, loss_cons, label_targets.shape[0], label_imgs.shape[-1]))
+
+                callbacks.run('on_train_batch_end', model, ni, label_imgs, label_targets, label_paths, list(mloss))
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
@@ -342,14 +550,26 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK in {-1, 0}:
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+            if ema:
+                ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
                 results, maps, _ = validate.run(data_dict,
                                                 batch_size=batch_size // WORLD_SIZE * 2,
                                                 imgsz=imgsz,
                                                 half=amp,
-                                                model=ema.ema,
+                                                model=deepcopy(model).eval(),
+                                                single_cls=single_cls,
+                                                dataloader=val_loader,
+                                                save_dir=save_dir,
+                                                plots=False,
+                                                callbacks=callbacks,
+                                                compute_loss=compute_loss)
+                results_teacher, maps, _ = validate.run(data_dict,
+                                                batch_size=batch_size // WORLD_SIZE * 2,
+                                                imgsz=imgsz,
+                                                half=amp,
+                                                model=deepcopy(model_teacher).eval(),
                                                 single_cls=single_cls,
                                                 dataloader=val_loader,
                                                 save_dir=save_dir,
@@ -359,10 +579,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            fi_teacher = fitness(np.array(results_teacher).reshape(1, -1))
             stop = stopper(epoch=epoch, fitness=fi)  # early stop check
             if fi > best_fitness:
                 best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
+            if fi_teacher > best_fitness_teacher:
+                best_fitness_teacher = fi_teacher
+            log_vals = list(results_teacher) + list(results) + lr
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
             # Save model
@@ -371,8 +594,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     'epoch': epoch,
                     'best_fitness': best_fitness,
                     'model': deepcopy(de_parallel(model)).half(),
-                    'ema': deepcopy(ema.ema).half(),
-                    'updates': ema.updates,
+                    # 'ema': deepcopy(ema.ema).half(),
+                    # 'updates': ema.updates,
                     'optimizer': optimizer.state_dict(),
                     'opt': vars(opt),
                     'date': datetime.now().isoformat()}
@@ -384,6 +607,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
+
+                ckpt = {
+                    'epoch': epoch,
+                    'best_fitness': best_fitness_teacher,
+                    'model': deepcopy(de_parallel(model_teacher)).half()}
+                
+                # Save last, best and delete
+                torch.save(ckpt, last_teacher)
+                if best_fitness_teacher == fi_teacher:
+                    torch.save(ckpt, best_teacher)
+                del ckpt
+
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
 
         # EarlyStopping
@@ -429,30 +664,40 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
+    parser.add_argument('--weights', type=str, default=ROOT / 'weights/TN/TN.pt', help='initial weights path')
+    parser.add_argument('--project', default=ROOT / 'runs/test', help='save to project/name')
+    parser.add_argument('--epochs', type=int, default=50, help='total training epochs')
+    parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--data', type=str, default=ROOT / 'data/coco.yaml', help='dataset.yaml path')
+
+
+
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
-    parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
+    
+    parser.add_argument('--batch-size', type=int, default=4, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
+    # 图像校正
     parser.add_argument('--rect', action='store_true', help='rectangular training')
+    # 是否从训练中断处继续训练
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
+    # 不保存模型
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--noval', action='store_true', help='only validate final epoch')
+    # 自动计算锚框
     parser.add_argument('--noautoanchor', action='store_true', help='disable AutoAnchor')
     parser.add_argument('--noplots', action='store_true', help='save no plot files')
+    # 是否进行超参数优化
     parser.add_argument('--evolve', type=int, nargs='?', const=300, help='evolve hyperparameters for x generations')
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='image --cache ram/disk')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW'], default='SGD', help='optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
+    # 加载数据的进程数量
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
-    parser.add_argument('--project', default=ROOT / 'runs/train', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
@@ -479,7 +724,6 @@ def main(opt, callbacks=Callbacks()):
         print_args(vars(opt))
         check_git_status()
         check_requirements()
-
     # Resume (from specified or most recent last.pt)
     if opt.resume and not check_comet_resume(opt) and not opt.evolve:
         last = Path(check_file(opt.resume) if isinstance(opt.resume, str) else get_latest_run())
@@ -508,6 +752,7 @@ def main(opt, callbacks=Callbacks()):
 
     # DDP mode
     device = select_device(opt.device, batch_size=opt.batch_size)
+    # device = torch.device('cuda:1')
     if LOCAL_RANK != -1:
         msg = 'is not compatible with YOLOv5 Multi-GPU DDP training'
         assert not opt.image_weights, f'--image-weights {msg}'

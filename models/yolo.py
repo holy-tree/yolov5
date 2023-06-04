@@ -29,6 +29,8 @@ from utils.plots import feature_visualization
 from utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
                                time_sync)
 
+import pprint
+
 try:
     import thop  # for FLOPs computation
 except ImportError:
@@ -111,17 +113,48 @@ class BaseModel(nn.Module):
     def forward(self, x, profile=False, visualize=False):
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
 
-    def _forward_once(self, x, profile=False, visualize=False):
+    def _forward_once(self, x, profile=False, visualize=False, pre_adain=False, adain=False, 
+                      unlabel_mean=None, unlabel_std=None, get_feature=False):
         y, dt = [], []  # outputs
+ 
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
+
+            
             x = m(x)  # run
+            
+            if m.i == 9:
+                if get_feature == True:
+                    return x
+                if pre_adain == True:
+                    with torch.no_grad():
+                        eps = 1e-5
+                        size = x.size()
+                        assert (len(size) == 4)
+                        N, C = size[:2]
+                        feat_var = x.view(N, C, -1).var(dim=2) + eps
+                        feat_std = feat_var.sqrt().view(N, C, 1, 1)
+                        feat_mean = x.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+                if adain == True:
+                    eps = 1e-5
+                    size = x.size()
+                    N, C = size[:2]
+                    content_var = x.view(N, C, -1).var(dim=2) + eps
+                    content_std = content_var.sqrt().view(N, C, 1, 1)
+                    content_mean = x.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+                    if unlabel_std.shape[0] == size[0]:
+                        x = (x - content_mean.expand(size)) / content_std.expand(size)
+                        x = x * unlabel_std.expand(size) + unlabel_mean.expand(size)
+
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
+        
+        if pre_adain == True:
+                return x, feat_mean, feat_std
         return x
 
     def _profile_one_layer(self, m, x, dt):
@@ -203,10 +236,10 @@ class DetectionModel(BaseModel):
         self.info()
         LOGGER.info('')
 
-    def forward(self, x, augment=False, profile=False, visualize=False):
+    def forward(self, x, augment=False, profile=False, visualize=False, pre_adain=False, adain=False, unlabel_mean=None, unlabel_std=None, get_feature=False):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
-        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+        return self._forward_once(x, profile, visualize, pre_adain=pre_adain, adain=adain, unlabel_mean=unlabel_mean, unlabel_std=unlabel_std, get_feature=get_feature)  # single-scale inference, train
 
     def _forward_augment(self, x):
         img_size = x.shape[-2:]  # height, width

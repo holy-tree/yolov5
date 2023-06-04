@@ -9,6 +9,7 @@ import torch.nn as nn
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
 
+import pprint
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
     # return positive, negative label smoothing BCE targets
@@ -118,10 +119,13 @@ class ComputeLoss:
         self.anchors = m.anchors
         self.device = device
 
-    def __call__(self, p, targets):  # predictions, targets
+    def __call__(self, p, targets, unlabel=False):  # predictions, targets
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
+
+        
+        # targets.shape = [11,6] target[0]是来自哪个图像
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
         # Losses
@@ -181,6 +185,7 @@ class ComputeLoss:
         gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
         targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
+        
 
         g = 0.5  # bias
         off = torch.tensor(
@@ -193,7 +198,6 @@ class ComputeLoss:
                 # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
             ],
             device=self.device).float() * g  # offsets
-
         for i in range(self.nl):
             anchors, shape = self.anchors[i], p[i].shape
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
