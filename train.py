@@ -311,7 +311,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         unlabel_data_iter = iter(unlabel_train_loader)
 
 
-        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'l_label', 'l_unlabel', 'loss_cons', 'Instances', 'Size'))
+        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'l_label', 'l_unlabel', 'loss_adain', 'Instances', 'Size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
@@ -326,78 +326,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             label_imgs, label_targets, label_paths, _ = next(label_data_iter)
             unlabel_imgs, unlabel_targets, unlabel_paths, _ = next(unlabel_data_iter)
 
-            # (i, label_data) = label_data
-            # label_imgs, label_targets, label_paths, _ = label_data
-            # (_, unlabel_data) = unlabel_data
-            # unlabel_imgs, unlabel_targets, unlabel_paths, _ = unlabel_data
-
             
-            aug_label_imgs = label_imgs.clone().detach()
-            aug_unlabel_imgs = unlabel_imgs.clone().detach()
-            augmentation = []
-            # 随机调整(概率为0.8)亮度、对比度、饱和度和色相
-            augmentation.append(transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8))
-            # # 将图像概率调整为灰度图
-            augmentation.append(transforms.RandomGrayscale(p=0.2))
-            augmentation.append(transforms.RandomApply([transforms.GaussianBlur(11, sigma=(0.1, 2.0))], p=0.5))
-            randcrop_transform = transforms.Compose(
-                [
-                    # transforms.ToTensor(),
-                    transforms.RandomErasing(p=0.7, scale=(0.05, 0.2), ratio=(0.3, 3.3), value="random"),
-                    transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.1, 6), value="random"),
-                    transforms.RandomErasing(p=0.3, scale=(0.02, 0.2), ratio=(0.05, 8), value="random"),
-                    # transforms.ToPILImage(),
-                ]
-            )
-            augmentation.append(randcrop_transform)
-            aug = transforms.Compose(augmentation)
-            for i in range(aug_unlabel_imgs.shape[0]):
-                aug_unlabel_imgs[i] = aug(aug_unlabel_imgs[i])
-            for i in range(aug_label_imgs.shape[0]):
-                aug_label_imgs[i] = aug(aug_label_imgs[i])
-
-
-            # for i in [0,1,2,3]:
-            #     img = unlabel_imgs[i].clone().detach().double().to(torch.device('cpu'))
-            #     img = np.ascontiguousarray(img.numpy().transpose((1,2,0)))
-
-            #     for index, img_number in enumerate(unlabel_targets[:, :1]):
-            #         if img_number == i:
-            #             x_center = float(unlabel_targets[index][2])*640 + 1
-            #             y_center = float(unlabel_targets[index][3])*640 + 1
-            #             xminVal = int(x_center - 0.5*float(unlabel_targets[index][4])*640)   # object_info列表中的元素都是字符串类型
-            #             yminVal = int(y_center - 0.5*float(unlabel_targets[index][5])*640)
-            #             xmaxVal = int(x_center + 0.5*float(unlabel_targets[index][4])*640)
-            #             ymaxVal = int(y_center + 0.5*float(unlabel_targets[index][5])*640)
-            #             img = cv2.rectangle(img, (xminVal, yminVal), (xmaxVal, ymaxVal), (0,255,0),2)
-            #     cv2.imwrite(f"unlabel_img{i}.jpg", img)
-
-
-            #     img = unlabel_imgs[i].clone().detach().double().to(torch.device('cpu'))
-            #     img = np.ascontiguousarray(img.numpy().transpose((1,2,0)))
-            #     cv2.imwrite(f"unlabel_img_native{i}.jpg", img)
-
-
-            # quit()
-            
-            # pprint.pprint(i)
-            # pprint.pprint(label_imgs.shape)
-            # pprint.pprint(label_targets.shape)
-            # pprint.pprint(unlabel_imgs.shape)
-            # pprint.pprint(unlabel_targets.shape)
-            # pprint.pprint(label_paths)
-            # pprint.pprint(unlabel_paths)
-            
-            # img = unlabel_imgs[1].clone().detach().double().to(torch.device('cpu'))
-            # img = np.ascontiguousarray(img.numpy().transpose((1,2,0)))
-            
-
 
             ni = i + nb * epoch  # number integrated batches (since train start)
             label_imgs = label_imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
             unlabel_imgs = unlabel_imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-            aug_unlabel_imgs = aug_unlabel_imgs.to(device, non_blocking=True).float() / 255
-            aug_label_imgs = aug_label_imgs.to(device, non_blocking=True).float() / 255
+            
 
 
             # Warmup
@@ -436,16 +370,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             
             # Forward
             with torch.cuda.amp.autocast(amp):
-                # len(pred) = 3
-                # pred[0].shape = [4,3,80,80,6]
-                # pred[1].shape = [4,3,40,40,6]
-                # pred[2].shape = [4,3,20,20,6]
-                
-
-                # 由于model.eval()
-                # len(pred)=2 pred[0].shape=[4,25222,6]
-                # len(pred[1])=3
-                # pred = model(label_imgs)  # forward
+            
                 # 计算伪标签
                 with torch.no_grad():
                     pseudo_preds = model_teacher(unlabel_imgs)
@@ -459,18 +384,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         pseudo_labels = torch.cat([pseudo_labels, pseudo_label], 0)
 
 
-                # for index, img_number in enumerate(pseudo_labels[:, :1]):
-                #     if img_number == 1:
-                #         x_center = float(pseudo_labels[index][2])*640 + 1
-                #         y_center = float(pseudo_labels[index][3])*640 + 1
-                #         xminVal = int(x_center - 0.5*float(pseudo_labels[index][4])*640)   # object_info列表中的元素都是字符串类型
-                #         yminVal = int(y_center - 0.5*float(pseudo_labels[index][5])*640)
-                #         xmaxVal = int(x_center + 0.5*float(pseudo_labels[index][4])*640)
-                #         ymaxVal = int(y_center + 0.5*float(pseudo_labels[index][5])*640)
-                #         img = cv2.rectangle(img, (xminVal, yminVal), (xmaxVal, ymaxVal), (0,255,0),2)
-                # cv2.imwrite(f"pseudo_label.jpg", img)
-
-                # quit()
 
 
                 # 伪标签监督
@@ -488,26 +401,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 label_adain_loss, label_adain_loss_items = compute_loss(pred_adain, label_targets.to(device))  
 
                 
-                label_feature = model(label_imgs, get_feature=True)
-                aug_label_feature = model(aug_label_imgs, get_feature=True)
-                
-                
-                loss_img_cons = 0.0
-                for feature, aug_feature in zip(label_feature, aug_label_feature):
-                    loss_img_cons += F.mse_loss(feature, aug_feature)
-                loss_img_cons = loss_img_cons * 0.1
-
-                loss_ins_cons = 0.0
-                for p, p_adain in zip(pred, pred_adain):
-                    loss_ins_cons += F.mse_loss(p, p_adain)
-                loss_ins_cons = loss_ins_cons * 0.1
-                loss_cons =  loss_ins_cons + loss_img_cons
+            
 
 
-                # loss_cons = 0
-                loss = unlabel_loss + label_loss + label_adain_loss * 0.1 + loss_cons * 0.1
-                # loss = unlabel_loss + label_loss + label_adain_loss * 0.1
-                # loss = unlabel_loss + label_loss
+              
+                loss = unlabel_loss + label_loss + label_adain_loss * 0.1
+               
 
 
                 if RANK != -1:
@@ -536,7 +435,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 # pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
                 #                      (f'{epoch}/{epochs - 1}', mem, *mloss, label_targets.shape[0], label_imgs.shape[-1]))
                 pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
-                                     (f'{epoch}/{epochs - 1}', mem, label_loss, unlabel_loss, loss_cons, label_targets.shape[0], label_imgs.shape[-1]))
+                                     (f'{epoch}/{epochs - 1}', mem, label_loss, unlabel_loss, label_adain_loss, label_targets.shape[0], label_imgs.shape[-1]))
 
                 callbacks.run('on_train_batch_end', model, ni, label_imgs, label_targets, label_paths, list(mloss))
                 if callbacks.stop_training:
@@ -667,7 +566,7 @@ def parse_opt(known=False):
     parser.add_argument('--weights', type=str, default=ROOT / 'weights/TN/TN.pt', help='initial weights path')
     parser.add_argument('--project', default=ROOT / 'runs/test', help='save to project/name')
     parser.add_argument('--epochs', type=int, default=50, help='total training epochs')
-    parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='1', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco.yaml', help='dataset.yaml path')
 
 
